@@ -746,6 +746,153 @@ def ops_summary(period: str = "last_10_days", top_n_exams: int = 10) -> Dict[str
     finally:
         cnx.close()
 
+from typing import Dict, Any, List, Optional
+
+
+@mcp.tool()
+def missing_reports_queue(
+    period: str = "last_10_days",
+    status_filter: Optional[List[str]] = None,
+    limit: int = 50
+) -> Dict[str, Any]:
+    """
+    Work queue of visits that are missing reports (snapshot-based).
+
+    Simple meaning:
+    - You give a time period like last_10_days / last_month
+    - I return a ranked list of imaging visits where the report is not available yet
+    - This is the "follow-up list" for ops staff to chase completion
+
+    Important note (DB dump):
+    - The queue is "as of the dump" (snapshot), not real-time.
+
+    Args:
+        period (str):
+            One of: last_10_days, last_30_days, this_month, last_month,
+                    this_quarter, last_quarter, this_year, last_year
+        status_filter (list[str] | None):
+            Optional list of order_status values to include (example: ["IP", "In Progress"]).
+            If None, includes all statuses.
+        limit (int):
+            Max rows to return (default 50, max 200)
+
+    Returns:
+        dict:
+            {
+              "date_range": {...},
+              "total_missing_reports_in_range": <int>,
+              "queue": [ ... ],
+              "notes": ...
+            }
+    """
+    limit = max(1, min(int(limit), 200))
+
+    cnx = get_conn()
+    try:
+        cur = cnx.cursor(dictionary=True)
+
+        # 1) Find snapshot end (latest date in dump)
+        cur.execute("SELECT MAX(visit_start) AS max_visit_start FROM visits;")
+        row = cur.fetchone()
+        if not row or row["max_visit_start"] is None:
+            return {"ok": False, "error": "visits table has no data (MAX(visit_start) is NULL)."}
+
+        snapshot_end = _to_date(row["max_visit_start"])
+
+        # 2) period -> date range (inclusive)
+        try:
+            start_date, end_date = _period_to_range(snapshot_end, period)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+        # 3) Build optional status filter SQL
+        status_sql = ""
+        params: List[Any] = [start_date, end_date]
+
+        if status_filter:
+            # normalize and keep only non-empty
+            cleaned = [s for s in status_filter if s and str(s).strip()]
+            if cleaned:
+                placeholders = ", ".join(["%s"] * len(cleaned))
+                status_sql = f" AND v.order_status IN ({placeholders}) "
+                params.extend(cleaned)
+
+        # 4) Count total missing reports in range
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM visits v
+            WHERE DATE(v.visit_start) BETWEEN %s AND %s
+              AND (v.report_id IS NULL OR v.report_id = '')
+              {status_sql}
+            """,
+            tuple(params),
+        )
+        total_cnt = (cur.fetchone() or {}).get("cnt", 0)
+
+        # 5) Pull queue rows (oldest first)
+        cur.execute(
+            f"""
+            SELECT
+              v.visit_start,
+              v.visit_no,
+              v.exam_code,
+              v.exam_description,
+              v.order_status,
+              v.machine,
+              v.patient_id,
+              p.pid AS patient_pid,
+              p.first_name,
+              p.last_name
+            FROM visits v
+            JOIN patients p ON p.id = v.patient_id
+            WHERE DATE(v.visit_start) BETWEEN %s AND %s
+              AND (v.report_id IS NULL OR v.report_id = '')
+              {status_sql}
+            ORDER BY v.visit_start ASC
+            LIMIT {limit};
+            """,
+            tuple(params),
+        )
+        rows = cur.fetchall()
+
+        cur.close()
+
+        # 6) Format queue a bit nicer
+        queue = []
+        for r in rows:
+            queue.append({
+                "visit_start": str(r.get("visit_start")),
+                "visit_no": r.get("visit_no"),
+                "exam": f"{r.get('exam_description')} ({r.get('exam_code')})".strip(),
+                "order_status": r.get("order_status"),
+                "machine": r.get("machine"),
+                "patient": {
+                    "id": r.get("patient_id"),
+                    "pid": r.get("patient_pid"),
+                    "name": f"{r.get('first_name','')} {r.get('last_name','')}".strip()
+                }
+            })
+
+        notes = "Queue is snapshot-based (as of latest date in dump)."
+
+        if status_filter:
+            notes += f" Status filter applied: {status_filter}"
+
+        return {
+            "ok": True,
+            "period": period,
+            "snapshot_latest_visit_date": str(snapshot_end),
+            "date_range": {"start": str(start_date), "end": str(end_date)},
+            "total_missing_reports_in_range": int(total_cnt),
+            "returned": len(queue),
+            "queue": queue,
+            "notes": notes,
+        }
+
+    finally:
+        cnx.close()
+
 
 if __name__ == "__main__":
     mcp.run()
