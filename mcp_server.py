@@ -203,25 +203,28 @@ def _select_list(cols: List[str], wanted: List[Optional[str]]) -> List[str]:
             out.append(f"`{c}`")
     return out
 
-
 @mcp.tool()
 def patient_profile(patient_query: str, max_visits: int = 10) -> Dict[str, Any]:
     """
     Show a complete profile for a single patient.
 
     Simple meaning:
-    - You give a patient name or ID
+    - You give a patient name or ID (or PID like ECC609Y)
     - I return:
-        * basic patient details
-        * recent imaging visits (if linkable)
+        * best matching patient (prefers exact PID/ID, then First+Last, then partials)
+        * recent imaging visits
         * whether each visit has a report (if linkable)
 
+    Why this version:
+    - Fixes the "multiple patients with same name" problem by ranking matches
+      and preferring the patient who actually has visits.
+
     Args:
-        patient_query (str): Patient identifier (name, MRN, or ID)
+        patient_query (str): Patient identifier (name, PID/MRN, or ID)
         max_visits (int): Maximum visits to return (default 10, max 25)
 
     Returns:
-        dict: { found, patient, visits, summary, schema_notes }
+        dict: { ok, found, patient, visits, summary, schema_notes }
     """
     if not patient_query or not str(patient_query).strip():
         return {"ok": False, "error": "patient_query is required."}
@@ -238,119 +241,200 @@ def patient_profile(patient_query: str, max_visits: int = 10) -> Dict[str, Any]:
 
         # --- Detect key patient columns ---
         p_pk = _pick_col(p_cols, ["id", "patient_id", "pat_id", "person_id", "pat_person_nbr", "pat_person_id"])
-        p_mrn = _pick_col(p_cols, ["mrn", "medical_record", "medical_record_number", "patient_mrn", "record_number"])
+        p_pid = _pick_col(p_cols, ["pid", "mrn", "medical_record", "medical_record_number", "patient_mrn", "record_number"])
         p_fname = _pick_col(p_cols, ["first_name", "firstname", "given_name"])
         p_lname = _pick_col(p_cols, ["last_name", "lastname", "family_name", "surname"])
         p_name = _pick_col(p_cols, ["name", "full_name"])
-        p_dob = _pick_col(p_cols, ["dob", "date_of_birth", "birth_date"])
+        p_dob = _pick_col(p_cols, ["dob", "dob_old", "date_of_birth", "birth_date"])
         p_gender = _pick_col(p_cols, ["gender", "sex"])
 
-        # --- Build patient search WHERE based on what exists ---
-        where = []
-        params: List[Any] = []
+        if not p_pk:
+            return {"ok": False, "error": "Could not detect primary key column in patients table."}
 
-        # Numeric query? try exact matches
+        # --- Detect visit columns / keys (use your real schema if present) ---
+        v_pk = _pick_col(v_cols, ["visit_no", "id", "visit_id", "appt_id", "appointment_id", "encounter_id", "encounter_nbr"])
+        v_patient_fk = _pick_col(v_cols, ["patient_id", "pat_id", "person_id", "pat_person_nbr", "patient_number", "pat_person_id"])
+        v_date = _pick_col(v_cols, ["visit_start", "visit_date", "appt_date", "appointment_date", "scheduled_date", "created_at", "appt_create_date", "create_date"])
+        v_status = _pick_col(v_cols, ["order_status", "status", "appt_status", "visit_status", "appt_status_desc", "status_desc"])
+        v_exam = _pick_col(v_cols, ["exam_description", "exam_code", "modality", "procedure", "reason_desc", "appt_class"])
+
+        # --- Build ranked patient search ---
+        like_full = f"%{q}%"
+        parts = q.split()
+        first_part = parts[0] if len(parts) >= 1 else ""
+        last_part = parts[-1] if len(parts) >= 2 else ""
+
+        where_clauses: List[str] = []
+        where_params: List[Any] = []
+
+        def _add_where(clause: Optional[str], *vals: Any):
+            if clause:
+                where_clauses.append(clause)
+                where_params.extend(vals)
+
+        # Candidate match clauses (OR)
         if q.isdigit():
-            if p_pk:
-                where.append(f"CAST(`{p_pk}` AS CHAR) = %s")
-                params.append(q)
-            if p_mrn:
-                where.append(f"CAST(`{p_mrn}` AS CHAR) = %s")
-                params.append(q)
+            _add_where(f"CAST(p.`{p_pk}` AS CHAR) = %s", q)
 
-        # Name-like matches
-        like = f"%{q}%"
+        if p_pid:
+            _add_where(f"CAST(p.`{p_pid}` AS CHAR) = %s", q)
+
         if p_name:
-            where.append(f"`{p_name}` LIKE %s")
-            params.append(like)
-        if p_fname:
-            where.append(f"`{p_fname}` LIKE %s")
-            params.append(like)
-        if p_lname:
-            where.append(f"`{p_lname}` LIKE %s")
-            params.append(like)
+            _add_where(f"p.`{p_name}` LIKE %s", like_full)
 
-        if not where:
+        if first_part and last_part and p_fname and p_lname:
+            _add_where(f"(p.`{p_fname}` LIKE %s AND p.`{p_lname}` LIKE %s)", f"%{first_part}%", f"%{last_part}%")
+
+        if p_fname:
+            _add_where(f"p.`{p_fname}` LIKE %s", like_full)
+
+        if p_lname:
+            _add_where(f"p.`{p_lname}` LIKE %s", like_full)
+
+        if not where_clauses:
             return {
                 "ok": False,
                 "error": "Could not determine searchable columns in patients table.",
                 "hint": "Run describe_reporting_table('patients') and confirm name/id columns.",
             }
 
-        # Only select useful columns (that exist)
-        patient_select = _select_list(
-            p_cols,
-            [p_pk, p_mrn, p_name, p_fname, p_lname, p_dob, p_gender]
-        )
-        if not patient_select:
-            patient_select = ["*"]
+        # Match score (higher = better), used to pick the correct patient when duplicates exist
+        score_parts: List[str] = []
+        score_params: List[Any] = []
 
+        if q.isdigit():
+            score_parts.append(f"WHEN CAST(p.`{p_pk}` AS CHAR) = %s THEN 100")
+            score_params.append(q)
+
+        if p_pid:
+            score_parts.append(f"WHEN CAST(p.`{p_pid}` AS CHAR) = %s THEN 90")
+            score_params.append(q)
+
+        if first_part and last_part and p_fname and p_lname:
+            score_parts.append(f"WHEN (p.`{p_fname}` LIKE %s AND p.`{p_lname}` LIKE %s) THEN 80")
+            score_params.extend([f"%{first_part}%", f"%{last_part}%"])
+
+        if p_name:
+            score_parts.append(f"WHEN p.`{p_name}` LIKE %s THEN 70")
+            score_params.append(like_full)
+
+        if p_fname:
+            score_parts.append(f"WHEN p.`{p_fname}` LIKE %s THEN 60")
+            score_params.append(like_full)
+
+        if p_lname:
+            score_parts.append(f"WHEN p.`{p_lname}` LIKE %s THEN 60")
+            score_params.append(like_full)
+
+        score_case = "CASE " + " ".join(score_parts) + " ELSE 0 END"
+
+        # Select useful patient columns
+        patient_select = _select_list(p_cols, [p_pk, p_pid, p_name, p_fname, p_lname, p_dob, p_gender])
+        if not patient_select:
+            patient_select_sql = "p.*"
+        else:
+            # patient_select items look like `col` -> prefix with p.
+            patient_select_sql = ", ".join([s.replace("`", "p.`", 1) for s in patient_select])
+
+        # If visits table doesn't have a linkable patient FK, we can still return patient info
+        if not v_patient_fk or not v_pk:
+            patient_sql = f"""
+                SELECT {patient_select_sql}, {score_case} AS match_score
+                FROM patients p
+                WHERE {" OR ".join(where_clauses)}
+                ORDER BY match_score DESC, p.`{p_pk}` DESC
+                LIMIT 1;
+            """
+            cur = cnx.cursor(dictionary=True)
+            cur.execute(patient_sql, score_params + where_params)
+            patient = cur.fetchone()
+            cur.close()
+
+            if not patient:
+                return {"ok": True, "found": False, "message": f"No patient found for '{q}'."}
+
+            return {
+                "ok": True,
+                "found": True,
+                "patient": patient,
+                "visits": [],
+                "summary": {
+                    "patient_name": (patient.get(p_name) if p_name else None)
+                    or f"{patient.get(p_fname,'') if p_fname else ''} {patient.get(p_lname,'') if p_lname else ''}".strip()
+                    or None,
+                    "total_visits_returned": 0,
+                    "visits_with_report": 0,
+                    "visits_missing_report": 0,
+                    "note": "Visits table could not be linked to patients with detected keys.",
+                },
+                "schema_notes": {
+                    "patients_pk": p_pk,
+                    "patients_pid": p_pid,
+                    "visits_pk": v_pk,
+                    "visits_patient_fk": v_patient_fk,
+                },
+            }
+
+        # Ranked patient query that prefers patients WITH visits when names collide
         patient_sql = f"""
-            SELECT {", ".join(patient_select)}
-            FROM `patients`
-            WHERE {" OR ".join(where)}
+            SELECT
+                {patient_select_sql},
+                COUNT(v.`{v_pk}`) AS visit_count,
+                {score_case} AS match_score
+            FROM patients p
+            LEFT JOIN visits v
+              ON v.`{v_patient_fk}` = p.`{p_pk}`
+            WHERE {" OR ".join(where_clauses)}
+            GROUP BY p.`{p_pk}`
+            ORDER BY match_score DESC, visit_count DESC, p.`{p_pk}` DESC
             LIMIT 1;
         """
 
         cur = cnx.cursor(dictionary=True)
-        cur.execute(patient_sql, params)
+        cur.execute(patient_sql, score_params + where_params)
         patient = cur.fetchone()
         cur.close()
 
         if not patient:
             return {"ok": True, "found": False, "message": f"No patient found for '{q}'."}
 
-        # Pick a patient identifier value to link visits
-        patient_id_value = None
-        if p_pk and p_pk in patient:
-            patient_id_value = patient[p_pk]
-        elif p_mrn and p_mrn in patient:
-            patient_id_value = patient[p_mrn]
+        # patient id to link visits (always use p_pk value)
+        patient_id_value = patient.get(p_pk)
 
-        # --- Detect visit columns / keys ---
-        v_pk = _pick_col(v_cols, ["id", "visit_id", "appt_id", "appointment_id", "encounter_id", "encounter_nbr"])
-        v_patient_fk = _pick_col(v_cols, ["patient_id", "pat_id", "person_id", "pat_person_nbr", "patient_number", "pat_person_id"])
-        v_date = _pick_col(v_cols, ["visit_date", "appt_date", "appointment_date", "scheduled_date", "created_at", "appt_create_date", "create_date"])
-        v_status = _pick_col(v_cols, ["status", "appt_status", "visit_status", "appt_status_desc", "status_desc"])
-        v_modality = _pick_col(v_cols, ["modality", "appt_class", "procedure", "reason_desc", "appt_svc_cntr_name", "appt_svc_cntr_code"])
+        # --- Fetch recent visits for this patient ---
+        visit_select_cols: List[str] = []
+        for c in [v_pk, v_patient_fk, v_date, v_status, v_exam]:
+            if c and c in v_cols and f"`{c}`" not in visit_select_cols:
+                visit_select_cols.append(f"`{c}`")
 
-        visits: List[Dict[str, Any]] = []
-        if v_patient_fk and patient_id_value is not None:
-            visit_select = []
-            # Always include primary keys if possible
-            for c in [v_pk, v_date, v_status, v_modality, v_patient_fk]:
-                if c and c in v_cols and c not in visit_select:
-                    visit_select.append(f"`{c}`")
+        if not visit_select_cols:
+            visit_select_cols = ["*"]
 
-            if not visit_select:
-                visit_select = ["*"]
+        order_by = f"ORDER BY `{v_date}` DESC" if v_date else (f"ORDER BY `{v_pk}` DESC" if v_pk else "")
+        visits_sql = f"""
+            SELECT {", ".join(visit_select_cols)}
+            FROM `visits`
+            WHERE `{v_patient_fk}` = %s
+            {order_by}
+            LIMIT %s;
+        """
 
-            order_by = f"ORDER BY `{v_date}` DESC" if v_date else (f"ORDER BY `{v_pk}` DESC" if v_pk else "")
-            visits_sql = f"""
-                SELECT {", ".join(visit_select)}
-                FROM `visits`
-                WHERE `{v_patient_fk}` = %s
-                {order_by}
-                LIMIT %s;
-            """
-
-            cur = cnx.cursor(dictionary=True)
-            cur.execute(visits_sql, (patient_id_value, max_visits))
-            visits = cur.fetchall()
-            cur.close()
+        cur = cnx.cursor(dictionary=True)
+        cur.execute(visits_sql, (patient_id_value, max_visits))
+        visits = cur.fetchall()
+        cur.close()
 
         # --- Attach report info if possible ---
-        # Detect report linkage keys
-        r_visit_fk = _pick_col(r_cols, ["visit_id", "appt_id", "appointment_id", "encounter_id", "encounter_nbr"])
+        r_visit_fk = _pick_col(r_cols, ["visit_no", "visit_id", "appt_id", "appointment_id", "encounter_id", "encounter_nbr"])
         r_status = _pick_col(r_cols, ["status", "report_status", "final_status", "status_desc"])
         r_created = _pick_col(r_cols, ["created_at", "create_date", "report_date", "dt_created"])
         r_signed = _pick_col(r_cols, ["signed_at", "finalized_at", "completed_at", "dt_signed"])
 
         reports_by_visit: Dict[Any, List[Dict[str, Any]]] = {}
+
         if visits and v_pk and r_visit_fk:
             visit_ids = [v.get(v_pk) for v in visits if v.get(v_pk) is not None]
             if visit_ids:
-                # Select only a few report columns
                 report_select_cols = [r_visit_fk, r_status, r_created, r_signed]
                 report_select_cols = [c for c in report_select_cols if c and c in r_cols]
                 if not report_select_cols:
@@ -369,12 +453,13 @@ def patient_profile(patient_query: str, max_visits: int = 10) -> Dict[str, Any]:
                 cur.close()
 
                 for r in report_rows:
-                    k = r.get(r_visit_fk)
-                    reports_by_visit.setdefault(k, []).append(r)
+                    key = r.get(r_visit_fk)
+                    reports_by_visit.setdefault(key, []).append(r)
 
         # Build final visits with report status
         visits_missing_report = 0
         final_visits: List[Dict[str, Any]] = []
+
         if visits and v_pk:
             for v in visits:
                 vid = v.get(v_pk)
@@ -387,11 +472,11 @@ def patient_profile(patient_query: str, max_visits: int = 10) -> Dict[str, Any]:
                 v2["report"] = {
                     "has_report": has_report,
                     "report_count": len(linked),
-                    "sample": linked[:1],  # keep it small/safe
+                    "sample": linked[:1],
                 }
                 final_visits.append(v2)
 
-        # Nice patient display fields
+        # Display name
         display_name = None
         if p_name and p_name in patient:
             display_name = patient.get(p_name)
@@ -408,10 +493,8 @@ def patient_profile(patient_query: str, max_visits: int = 10) -> Dict[str, Any]:
             "note": None,
         }
 
-        if not v_patient_fk:
-            summary["note"] = "Could not link visits to patient (missing patient FK in visits table)."
-        elif not r_visit_fk:
-            summary["note"] = "Could not link reports to visits (missing visit FK in reports table)."
+        if not r_visit_fk:
+            summary["note"] = "Could not link reports to visits (missing visit key in reports table)."
 
         return {
             "ok": True,
@@ -421,7 +504,7 @@ def patient_profile(patient_query: str, max_visits: int = 10) -> Dict[str, Any]:
             "summary": summary,
             "schema_notes": {
                 "patients_pk": p_pk,
-                "patients_mrn": p_mrn,
+                "patients_pid": p_pid,
                 "visits_pk": v_pk,
                 "visits_patient_fk": v_patient_fk,
                 "visits_date_col": v_date,
@@ -431,6 +514,7 @@ def patient_profile(patient_query: str, max_visits: int = 10) -> Dict[str, Any]:
 
     finally:
         cnx.close()
+
 
 if __name__ == "__main__":
     mcp.run()
