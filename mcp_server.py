@@ -515,6 +515,237 @@ def patient_profile(patient_query: str, max_visits: int = 10) -> Dict[str, Any]:
     finally:
         cnx.close()
 
+from datetime import datetime, date, timedelta
+import calendar
+from typing import Dict, Any, List, Optional
+
+
+def _to_date(x) -> date:
+    """Convert MySQL datetime/date/str to python date."""
+    if x is None:
+        raise ValueError("Cannot convert None to date")
+    if isinstance(x, date) and not isinstance(x, datetime):
+        return x
+    if isinstance(x, datetime):
+        return x.date()
+    # fallback: parse string
+    return datetime.fromisoformat(str(x)).date()
+
+
+def _month_range(d: date) -> (date, date):
+    """Return first and last day of month for date d."""
+    first = d.replace(day=1)
+    last_day = calendar.monthrange(d.year, d.month)[1]
+    last = d.replace(day=last_day)
+    return first, last
+
+
+def _quarter(d: date) -> int:
+    return ((d.month - 1) // 3) + 1
+
+
+def _quarter_range(d: date) -> (date, date):
+    """Return first and last day of quarter for date d."""
+    q = _quarter(d)
+    start_month = (q - 1) * 3 + 1
+    end_month = start_month + 2
+    start = date(d.year, start_month, 1)
+    end_last_day = calendar.monthrange(d.year, end_month)[1]
+    end = date(d.year, end_month, end_last_day)
+    return start, end
+
+
+def _shift_month(d: date, months: int) -> date:
+    """Shift date by N months, clamping day to month length."""
+    y = d.year + (d.month - 1 + months) // 12
+    m = (d.month - 1 + months) % 12 + 1
+    day = min(d.day, calendar.monthrange(y, m)[1])
+    return date(y, m, day)
+
+
+def _period_to_range(snapshot_end: date, period: str) -> (date, date):
+    """
+    Interpret period relative to snapshot_end (latest date in dump).
+    Returns (start_date, end_date) inclusive.
+    """
+    p = (period or "").strip().lower()
+
+    if p in ("last_10_days", "last10days", "last-10-days"):
+        return snapshot_end - timedelta(days=9), snapshot_end
+
+    if p in ("last_30_days", "last30days", "last-30-days"):
+        return snapshot_end - timedelta(days=29), snapshot_end
+
+    if p in ("this_month", "month_to_date", "mtd"):
+        start = snapshot_end.replace(day=1)
+        return start, snapshot_end
+
+    if p in ("last_month",):
+        prev = _shift_month(snapshot_end.replace(day=1), -1)
+        start, end = _month_range(prev)
+        return start, end
+
+    if p in ("this_quarter", "quarter_to_date", "qtd"):
+        q_start, _ = _quarter_range(snapshot_end)
+        return q_start, snapshot_end
+
+    if p in ("last_quarter",):
+        # take the first day of current quarter, go back 1 day, then get that quarter range
+        this_q_start, _ = _quarter_range(snapshot_end)
+        prev_q_day = this_q_start - timedelta(days=1)
+        return _quarter_range(prev_q_day)
+
+    if p in ("this_year", "year_to_date", "ytd"):
+        start = date(snapshot_end.year, 1, 1)
+        return start, snapshot_end
+
+    if p in ("last_year",):
+        start = date(snapshot_end.year - 1, 1, 1)
+        end = date(snapshot_end.year - 1, 12, 31)
+        return start, end
+
+    raise ValueError(
+        "Unsupported period. Use one of: "
+        "last_10_days, last_30_days, this_month, last_month, this_quarter, last_quarter, this_year, last_year"
+    )
+
+
+@mcp.tool()
+def ops_summary(period: str = "last_10_days", top_n_exams: int = 10) -> Dict[str, Any]:
+    """
+    Operations summary for a time period (snapshot-based).
+
+    Simple meaning:
+    - You give a period like:
+        * last_10_days
+        * last_month
+        * last_year
+        * this_quarter
+        * last_quarter
+    - I summarize radiology activity for that period:
+        * total visits
+        * visits by status
+        * top exams
+        * daily volume trend
+        * reports pending vs available (based on report_id)
+
+    Important note (because you have a DB dump):
+    - "last_month / last_10_days" is calculated relative to the latest visit_start in your dump,
+      not today's real date.
+
+    Args:
+        period (str): One of the supported period values.
+        top_n_exams (int): How many top exams to return (max 25).
+
+    Returns:
+        dict: A clean ops summary for the requested period.
+    """
+    top_n_exams = max(1, min(int(top_n_exams), 25))
+
+    cnx = get_conn()
+    try:
+        cur = cnx.cursor(dictionary=True)
+
+        # 1) Find snapshot end date (latest date in dump)
+        cur.execute("SELECT MAX(visit_start) AS max_visit_start FROM visits;")
+        row = cur.fetchone()
+        if not row or row["max_visit_start"] is None:
+            return {"ok": False, "error": "visits table has no data (MAX(visit_start) is NULL)."}
+
+        snapshot_end = _to_date(row["max_visit_start"])
+
+        # 2) Convert 'period' -> date range (inclusive)
+        try:
+            start_date, end_date = _period_to_range(snapshot_end, period)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+        # 3) Total visits + report availability (using visits.report_id)
+        cur.execute(
+            """
+            SELECT
+              COUNT(*) AS total_visits,
+              SUM(CASE WHEN report_id IS NULL OR report_id = '' THEN 1 ELSE 0 END) AS visits_missing_report,
+              SUM(CASE WHEN report_id IS NOT NULL AND report_id <> '' THEN 1 ELSE 0 END) AS visits_with_report
+            FROM visits
+            WHERE DATE(visit_start) BETWEEN %s AND %s;
+            """,
+            (start_date, end_date),
+        )
+        totals = cur.fetchone() or {}
+
+        # 4) Visits by status
+        cur.execute(
+            """
+            SELECT
+              order_status,
+              COUNT(*) AS count
+            FROM visits
+            WHERE DATE(visit_start) BETWEEN %s AND %s
+            GROUP BY order_status
+            ORDER BY count DESC;
+            """,
+            (start_date, end_date),
+        )
+        by_status = cur.fetchall()
+
+        # 5) Top exams (code + description)
+        cur.execute(
+            f"""
+            SELECT
+              exam_code,
+              exam_description,
+              COUNT(*) AS count
+            FROM visits
+            WHERE DATE(visit_start) BETWEEN %s AND %s
+            GROUP BY exam_code, exam_description
+            ORDER BY count DESC
+            LIMIT {top_n_exams};
+            """,
+            (start_date, end_date),
+        )
+        top_exams = cur.fetchall()
+
+        # 6) Daily volume trend + busiest day
+        cur.execute(
+            """
+            SELECT
+              DATE(visit_start) AS day,
+              COUNT(*) AS visit_count
+            FROM visits
+            WHERE DATE(visit_start) BETWEEN %s AND %s
+            GROUP BY DATE(visit_start)
+            ORDER BY day ASC;
+            """,
+            (start_date, end_date),
+        )
+        daily = cur.fetchall()
+
+        busiest_day = None
+        if daily:
+            busiest_day = max(daily, key=lambda x: x.get("visit_count", 0))
+
+        cur.close()
+
+        return {
+            "ok": True,
+            "period": period,
+            "snapshot_latest_visit_date": str(snapshot_end),
+            "date_range": {"start": str(start_date), "end": str(end_date)},
+            "totals": {
+                "total_visits": int(totals.get("total_visits") or 0),
+                "visits_with_report": int(totals.get("visits_with_report") or 0),
+                "visits_missing_report": int(totals.get("visits_missing_report") or 0),
+            },
+            "by_status": by_status,
+            "top_exams": top_exams,
+            "daily_volume": daily,
+            "busiest_day": busiest_day,
+        }
+
+    finally:
+        cnx.close()
+
 
 if __name__ == "__main__":
     mcp.run()
