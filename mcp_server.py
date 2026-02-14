@@ -893,6 +893,5 @@ def missing_reports_queue(
     finally:
         cnx.close()
 
-
 if __name__ == "__main__":
     mcp.run()
